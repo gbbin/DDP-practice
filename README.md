@@ -1,45 +1,45 @@
-# 一看就懂的DDP代码实践
+# A Demo of training with DDP
 
-本文对 PyTorch 中的 DistributedDataParallel（DDP）及混合精度模块的使用方式进行讲解。
+\[ English | [中文](README_zh.md) \]
 
-关于 DDP 的原理及其相较于 DataParallel（DP）的优势，前人之述备矣，本文不再花费大量篇幅。
+This blog presents a demonstration of training utilizing DistributedDataParallel (DDP) and Automatic Mixed Precision (AMP) in PyTorch.
 
-> 更新：添加 torchrun 启动方式示例
+Our emphasis is on the implementation aspects rather than the fundamental mechanisms.
 
-## 目录
-- [一看就懂的DDP代码实践](#一看就懂的ddp代码实践)
-  - [目录](#目录)
-  - [原型](#原型)
-    - [入口](#入口)
-    - [初始化](#初始化)
+## TOC
+- [A Demo of training with DDP](#a-demo-of-training-with-ddp)
+  - [TOC](#toc)
+  - [Baseline](#baseline)
+    - [Entry](#entry)
+    - [Initilization](#initilization)
     - [main](#main)
-    - [模型](#模型)
-    - [训练](#训练)
-    - [测试](#测试)
-  - [DDP示例](#ddp示例)
-    - [入口](#入口-1)
-    - [初始化](#初始化-1)
+    - [Model](#model)
+    - [Train](#train)
+    - [Test](#test)
+  - [DDP](#ddp)
+    - [Entry](#entry-1)
+    - [Initialization](#initialization)
     - [main](#main-1)
-      - [DDP初始化](#ddp初始化)
-      - [模型](#模型-1)
+      - [DDP init](#ddp-init)
+      - [model](#model-1)
       - [scaler](#scaler)
-    - [训练](#训练-1)
-    - [测试](#测试-1)
-  - [用torchrun启动](#用torchrun启动)
+    - [Train](#train-1)
+    - [Test](#test-1)
+  - [Initiate with torchrun](#initiate-with-torchrun)
   - [Checklist](#checklist)
   - [PS](#ps)
 
-本文参考了大量知乎文章、PyTorch文档及ChatGPT的回答，最主要参考的是[这篇文章](https://github.com/KaiiZhang/DDP-Tutorial/blob/main/DDP-Tutorial.md)。在这些基础上，结合个人项目中使用的情况，追求给出一个贴近 DL 项目现实且简洁、高效、可拓展的示例。
+The DistributedDataParallel implementation referenced in this blog consults various blogs and documentation, drawing significant insights from [this particular tutorial](https://github.com/KaiiZhang/DDP-Tutorial/blob/main/DDP-Tutorial.md). Building upon this foundation, we endeavor to provide a demonstration that is both accurate and aligned with the conventions of deep learning research literature.
 
-本文的代码针对单机多卡的情况，使用 nccl 后端，并通过 env 进行初始化。全部代码在[这里](https://github.com/rickyang1114/DDP-practice)。带有注释的行将着重讲解。
+The codebase is tailored specifically for training scenarios involving a single node with multiple GPUs. We employ the NCCL backend for communication and initialize the environment accordingly. Code segments marked with `###` will be the primary focus of our discussion.
 
-## 原型
+## Baseline
 
-首先，给出不使用 DDP 和 混合精度加速的代码。完整程序在[这里](https://github.com/rickyang1114/DDP-practice/blob/main/origin_main.py)。
+The baseline code for training without DistributedDataParallel (DDP) and Automatic Mixed Precision (AMP) is available [here](origin_main.py).
 
-### 入口
+### Entry
 
-看看程序的入口：执行`main`函数并计时。
+Consider the entry point of the code: we execute the `main` function and measure the duration of the process:
 
 ```python
 if __name__ == '__main__':
@@ -50,54 +50,55 @@ if __name__ == '__main__':
     print(f'\ntime elapsed: {time_elapsed:.2f} seconds')
 ```
 
-### 初始化
+### Initilization
 
-第二行的`prepare`函数用于获取命令行参数：
+The `preparer` function is utilized to retrieve command-line arguments:
 
 ```python
 def prepare():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--gpu', default='0')
-    parser.add_argument('-e',
-                        '--epochs',
-                        default=3,
-                        type=int,
-                        metavar='N',
-                        help='number of total epochs to run')
-    parser.add_argument('-b',
-                        '--batch_size',
-                        default=32,
-                        type=int,
-                        metavar='N',
-                        help='number of batchsize')
+    parser.add_argument("--gpu", default="0")
+    parser.add_argument(
+        "-e",
+        "--epochs",
+        default=3,
+        type=int,
+        metavar="N",
+        help="number of total epochs to run",
+    )
+    parser.add_argument(
+        "-b",
+        "--batch_size",
+        default=32,
+        type=int,
+        metavar="N",
+        help="number of batchsize",
+    )
     args = parser.parse_args()
     return args
 ```
 
 ### main
-
-在`main`函数中，首先通过`parse_args`获得一些训练相关的命令行参数，然后设定模型、损失函数、优化器、数据集。接着依次进行训练、测试，并保存模型的`state_dict`。
+Within the `main` function, we commence by acquiring training-related arguments, followed by configuring the model, loss function, optimizer, and dataset. Subsequently, we advance to the phases of training, evaluation, and persisting the model's `state_dict`.
 
 ```python
 def main(args):
-    model = ConvNet().cuda()  ###
+    model = ConvNet().cuda()
     criterion = nn.CrossEntropyLoss().cuda()
     optimizer = torch.optim.SGD(model.parameters(), 1e-4)
-    train_dataset = torchvision.datasets.MNIST(root='./data',
-                                               train=True,
-                                               transform=transforms.ToTensor(),
-                                               download=True)
+    train_dataset = torchvision.datasets.MNIST(
+        root="./data", train=True, transform=transforms.ToTensor(), download=True
+    )
     train_dloader = torch.utils.data.DataLoader(
         dataset=train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=4,
         pin_memory=True,
     )
-    test_dataset = torchvision.datasets.MNIST(root='./data',
-                                              train=False,
-                                              transform=transforms.ToTensor(),
-                                              download=True)
+    test_dataset = torchvision.datasets.MNIST(
+        root="./data", train=False, transform=transforms.ToTensor(), download=True
+    )
     test_dloader = torch.utils.data.DataLoader(
         dataset=test_dataset,
         batch_size=args.batch_size,
@@ -106,32 +107,35 @@ def main(args):
         pin_memory=True,
     )
     for epoch in range(args.epochs):
-        print(f'begin training of epoch {epoch + 1}/{args.epochs}')
-        train(model, train_dloader, criterion, optimizer)  ###
-    print(f'begin testing')
-    test(model, test_dloader)  ###
-    torch.save({'model': model.state_dict()}, 'origin_checkpoint.pt')
+        print(f"begin training of epoch {epoch + 1}/{args.epochs}")
+        train(model, train_dloader, criterion, optimizer)
+    print(f"begin testing")
+    test(model, test_dloader)
+    torch.save({"model": model.state_dict()}, "origin_checkpoint.pt")
 ```
 
-### 模型
+### Model
 
-上面第一行使用的模型为一个简单的 CNN：
+The model used here is a simple CNN:
 
 ```python
 import torch.nn as nn
 
 class ConvNet(nn.Module):
-
     def __init__(self, num_classes=10):
         super(ConvNet, self).__init__()
         self.layer1 = nn.Sequential(
             nn.Conv2d(1, 16, kernel_size=5, stride=1, padding=2),
-            nn.BatchNorm2d(16), nn.ReLU(), nn.MaxPool2d(kernel_size=2,
-                                                        stride=2))
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
         self.layer2 = nn.Sequential(
             nn.Conv2d(16, 32, kernel_size=5, stride=1, padding=2),
-            nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(kernel_size=2,
-                                                        stride=2))
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
         self.fc = nn.Linear(7 * 7 * 32, num_classes)
 
     def forward(self, x):
@@ -142,9 +146,9 @@ class ConvNet(nn.Module):
         return out
 ```
 
-### 训练
+### Train
 
-训练使用的`train`函数：
+The `train` function is:
 
 ```python
 def train(model, train_dloader, criterion, optimizer):
@@ -159,9 +163,9 @@ def train(model, train_dloader, criterion, optimizer):
         optimizer.step()
 ```
 
-### 测试
+### Test
 
-测试使用的`test`函数：
+The `test` function is:
 
 ```python
 def test(model, test_dloader):
@@ -179,13 +183,13 @@ def test(model, test_dloader):
     print(f'Accuracy is {acc:.2%}')
 ```
 
-最后，启动命令如下：
+Finally, we execute the Python script as follows:
 
 ```bash
 python origin_main.py --gpu 0
 ```
 
-输出的结果：
+Outputs
 
 ```bash
 begin training of epoch 1/3
@@ -197,125 +201,139 @@ Accuracy is 91.55%
 time elapsed: 22.72 seconds
 ```
 
-## DDP示例
+## DDP
 
-在介绍完原型后，以下对代码进行改造，以使用DDP。完整程序在[这里](https://github.com/rickyang1114/DDP-practice/blob/main/ddp_main.py)。
+Following the presentation of the baseline, we adapt the code to incorporate DDP. The modified code can be accessed [here](ddp_main.py).
 
-### 入口
+### Entry
 
-首先，我们在`if __name__ == '__main__'`中启动 DDP：
+We setup DDP within the scope of `if __name__ == '__main__'`:
 
 ```python
+import torch.multiprocessing as mp
+
 if __name__ == '__main__':
     args = prepare()  ###
     time_start = time.time()
-    mp.spawn(main, args=(args, ), nprocs=torch.cuda.device_count())  #import torch.multiprocessing as mp
+    mp.spawn(main, args=(args, ), nprocs=torch.cuda.device_count())
     time_elapsed = time.time() - time_start
     print(f'\ntime elapsed: {time_elapsed:.2f} seconds')
 ```
 
-`spawn`函数的主要参数包括以下几个：
+The arguments for the `spawn` function are detailed as follows:
 
-1. `fn`，即上面传入的`main`函数。每个线程将执行一次该函数
-2. `args`，即`fn`所需的参数。传给`fn`的参数必须写成元组的形式，哪怕像上面一样只有一个
-3. `nprocs`启动的进程数，将其设置为`world_size`即可。不传默认为1，与`world_size`不一致会导致进程等待同步而一直停滞。
+1. `fn`: This is the `main` function referenced earlier. Each spawned process will execute this function once.
+2. `args`: These are the arguments for `fn`. They must be provided in the form of a tuple, even when there is only a single element.
+3. `nprocs`: This specifies the number of processes to initiate. It should be set to the same value as `world_size`, with the default being 1. Should this number differ from `world_size`, the processes will halt and await synchronization.
 
-### 初始化
+### Initialization
 
-在`prepare`函数里面，也进行了一些 DDP 的配置：
+Within the `prepare` function, several specifications pertinent to DDP are established:
 
 ```python
 def prepare():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--gpu', default='0,1')
-    parser.add_argument('-e',
-                        '--epochs',
-                        default=3,
-                        type=int,
-                        metavar='N',
-                        help='number of total epochs to run')
-    parser.add_argument('-b',
-                        '--batch_size',
-                        default=32,
-                        type=int,
-                        metavar='N',
-                        help='number of batchsize')
+    parser.add_argument("--gpu", default="0,1")
+    parser.add_argument(
+        "-e",
+        "--epochs",
+        default=3,
+        type=int,
+        metavar="N",
+        help="number of total epochs to run",
+    )
+    parser.add_argument(
+        "-b",
+        "--batch_size",
+        default=32,
+        type=int,
+        metavar="N",
+        help="number of batchsize",
+    )
     args = parser.parse_args()
-    
-    # 下面几行是新加的，用于启动多进程 DDP。使用 torchrun 启动时只需要设置使用的 GPU
-    os.environ['MASTER_ADDR'] = 'localhost'  # 0号机器的 IP
-    os.environ['MASTER_PORT'] = '19198'  # 0号机器的可用端口，随便选一个没被占用的
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu  # 使用哪些 GPU
-    world_size = torch.cuda.device_count() # 就是上一行使用的 GPU 数量
-    os.environ['WORLD_SIZE'] = str(world_size)
+
+    # The following environment variables are set to enable DDP
+    os.environ["MASTER_ADDR"] = "localhost"  # IP address of the master machine
+    os.environ["MASTER_PORT"] = "19198"  # port number of the master machine
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu  # specify the GPUs to use
+    world_size = torch.cuda.device_count()
+    os.environ["WORLD_SIZE"] = str(world_size)
     return args
 ```
 
 ### main
-
-再来看看`main`函数里面添加了什么。首先是其添加一个额外的参数`local_rank`（在`mp.spawn`里面不用传，会自动分配）
+In the `main` function, an argument `local_rank` is introduced.
 
 ```python
 def main(local_rank, args):
-    init_ddp(local_rank)  ### 进程初始化
-    model = ConvNet().cuda()  ### 模型的 forward 方法变了
-    model = nn.SyncBatchNorm.convert_sync_batchnorm(model)  ### 转换模型的 BN 层
-    model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])  ### 套 DDP
+    init_ddp(local_rank)  ### init DDP
+    model = (
+        ConvNet().cuda()
+    )  ### Note: the `forward` method of the model has been modified
+    model = nn.SyncBatchNorm.convert_sync_batchnorm(model)  ### Convert BatchNorm layers
+    model = nn.parallel.DistributedDataParallel(
+        model, device_ids=[local_rank]
+    )  ### Wrap with DDP
     criterion = nn.CrossEntropyLoss().cuda()
     optimizer = torch.optim.SGD(model.parameters(), 1e-4)
-    scaler = GradScaler()  ###  用于混合精度训练
-    train_dataset = torchvision.datasets.MNIST(root='./data',
-                                               train=True,
-                                               transform=transforms.ToTensor(),
-                                               download=True)
+    scaler = GradScaler()  ### Used for mixed precision training
+    train_dataset = torchvision.datasets.MNIST(
+        root="./data", train=True, transform=transforms.ToTensor(), download=True
+    )
     train_sampler = torch.utils.data.distributed.DistributedSampler(
-        train_dataset)  ### 用于在 DDP 环境下采样
+        train_dataset
+    )  ### Sampler specifically for DDP
     g = get_ddp_generator()  ###
-    train_dloader = torch.utils.data.DataLoader(dataset=train_dataset,
-                                                batch_size=args.batch_size,
-                                                shuffle=False,
-                                                num_workers=4,
-                                                pin_memory=True,
-                                                sampler=train_sampler,
-                                                generator=g)  ### 添加额外的 generator
-    test_dataset = torchvision.datasets.MNIST(root='./data',
-                                              train=False,
-                                              transform=transforms.ToTensor(),
-                                              download=True)
+    train_dloader = torch.utils.data.DataLoader(
+        dataset=train_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,  ### shuffle is mutually exclusive with sampler
+        num_workers=4,
+        pin_memory=True,
+        sampler=train_sampler,
+        generator=g,
+    )  ### generator is used for random seed
+    test_dataset = torchvision.datasets.MNIST(
+        root="./data", train=False, transform=transforms.ToTensor(), download=True
+    )
     test_sampler = torch.utils.data.distributed.DistributedSampler(
-        test_dataset)  ### 用于在 DDP 环境下采样
-    test_dloader = torch.utils.data.DataLoader(dataset=test_dataset,
-                                               batch_size=args.batch_size,
-                                               shuffle=False,
-                                               num_workers=2,
-                                               pin_memory=True,
-                                               sampler=test_sampler)
+        test_dataset
+    )  ### Sampler specifically for DDP
+    test_dloader = torch.utils.data.DataLoader(
+        dataset=test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True,
+        sampler=test_sampler,
+    )
     for epoch in range(args.epochs):
-        if local_rank == 0:  ### 防止每个进程都输出一次
-            print(f'begin training of epoch {epoch + 1}/{args.epochs}')
-        train_dloader.sampler.set_epoch(epoch)  ### 防止采样出 bug
+        if local_rank == 0:  ### avoid redundant printing for each process
+            print(f"begin training of epoch {epoch + 1}/{args.epochs}")
+        train_dloader.sampler.set_epoch(epoch)  ### set epoch for sampler
         train(model, train_dloader, criterion, optimizer, scaler)
     if local_rank == 0:
-        print(f'begin testing')
+        print(f"begin testing")
     test(model, test_dloader)
-    if local_rank == 0:  ### 防止每个进程都保存一次
-        torch.save({'model': model.state_dict(), 'scaler': scaler.state_dict()}, 'ddp_checkpoint.pt')
-    dist.destroy_process_group()  ### 最后摧毁进程，和 init_process_group 相对
+    if local_rank == 0:  ### avoid redundant saving for each process
+        torch.save(
+            {"model": model.state_dict(), "scaler": scaler.state_dict()},
+            "ddp_checkpoint.pt",
+        )
+    dist.destroy_process_group() ### destroy the process group, in accordance with init_process_group.
 ```
 
-#### DDP初始化
-
-首先，根据用`init_ddp`函数对模型进行初始化。这里我们使用 nccl 后端，并用 env 作为初始化方法：
+#### DDP init
+We begin by initializing the model using the `init_ddp` function, employing the `nccl` backend and `env` method:
 
 ```python
 def init_ddp(local_rank):
-    # 有了这一句之后，在转换device的时候直接使用 a=a.cuda()即可，否则要用a=a.cuda(local_rank)
-    torch.cuda.set_device(local_rank)  
-    os.environ['RANK'] = str(local_rank)
-    dist.init_process_group(backend='nccl', init_method='env://')
+    # after this setup, tensors can be moved to GPU via `a = a.cuda()` rather than `a = a.to(local_rank)`
+    torch.cuda.set_device(local_rank)
+    os.environ["RANK"] = str(local_rank)
+    dist.init_process_group(backend="nccl", init_method="env://")
 ```
-
-在完成了该初始化后，可以很轻松地在需要时获得`local_rank`、`world_size`，而不需要作为额外参数从`main`中一层一层往下传。
+Following initialization, we can readily acquire `local_rank` and `world_size` without the need to pass them as additional arguments through each function.
 
 ```python
 import torch.distributed as dist
@@ -323,24 +341,21 @@ local_rank = dist.get_rank()
 world_size = dist.get_world_size()
 ```
 
-比如需要`print`, `log`, `save_state_dict`时，由于多个进程拥有相同的副本，故只需要一个进程执行即可，比如：
+For instance, operations such as `print`, `log`, or `save_state_dict`, can be executed on a single process since all processes maintain an identical version. This can be exemplified as follows:
 
 ```python
 if local_rank == 0:
     print(f'begin testing')
-if local_rank == 0:  ### 防止每个进程都保存一次
+if local_rank == 0:
     torch.save({'model': model.state_dict(), 'scaler': scaler.state_dict()}, 'ddp_checkpoint.pt')
 ```
 
-#### 模型
-
-为了加速推理，我们在模型的`forward`方法里套一个`torch.cuda.amp.autocast()`：
-
-使得`forward`函数变为：
+#### model
+To acclerate inference, we integrate `torch.cuda.amp.autocast()` within the model's `forward` method as:
 
 ```python
 def forward(self, x):
-    with torch.cuda.amp.autocast():  # 混合精度，加速推理
+    with torch.cuda.amp.autocast():  # utilize mixed precision training to accelerate training and inference
         out = self.layer1(x)
         out = self.layer2(out)
         out = out.reshape(out.size(0), -1)
@@ -348,22 +363,21 @@ def forward(self, x):
     return out
 ```
 
-autocast 也可以在推理的时候再套，但是在这里套最方便，而且适用于所有情况。
+While `autocast` may be utilized outside the `forward` function, employing it within this method is the most convenient and universally applicable approach.
 
-在模型改变之后，使用`convert_sync_batchnorm`和`DistributedDataParallel`对模型进行包装。
+After that, we need to convert the model using `convert_sync_batchnorm` and `DistributedDataParallel`.
 
 #### scaler
-
-创建 scaler，用于训练时对 loss 进行 scale：
+We instantiate a `GradScaler` to dynamically scale the loss during training:
 
 ```python
 from torch.cuda.amp import GradScaler
-scaler = GradScaler()  ###  用于混合精度训练
+scaler = GradScaler()
 ```
 
-### 训练
+### Train
+When employing DDP, it is necessary to use `torch.utils.data.distributed.DistributedSampler` and provide a `generator` when `num_workers > 1`. Failing to do so will result in identical augmentations across all processes for each worker, thereby reducing randomness. A detailed analysis is available [here](https://zhuanlan.zhihu.com/p/618639620).
 
-训练时，需要使用 DDP 的sampler，并且在`num_workers > 1`时需要传入`generator`，否则对于同一个worker，所有进程的augmentation相同，减弱训练的随机性。详细分析参见[这篇文章](https://zhuanlan.zhihu.com/p/618639620)。
 
 ```python
 def get_ddp_generator(seed=3407):
@@ -373,20 +387,23 @@ def get_ddp_generator(seed=3407):
     return g
 
 train_sampler = torch.utils.data.distributed.DistributedSampler(
-        train_dataset)  ### 用于在 DDP 环境下采样
-g = get_ddp_generator()  ###
-train_dloader = torch.utils.data.DataLoader(dataset=train_dataset,
-                                            batch_size=args.batch_size,
-                                            shuffle=False,  ### shuffle 通过 sampler 完成
-                                            num_workers=4,
-                                            pin_memory=True,
-                                            sampler=train_sampler,
-                                            generator=g)  ### 添加额外的 generator
+        train_dataset
+    )  ### Sampler specifically for DDP
+    g = get_ddp_generator()  ###
+    train_dloader = torch.utils.data.DataLoader(
+        dataset=train_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,  ### shuffle is mutually exclusive with sampler
+        num_workers=4,
+        pin_memory=True,
+        sampler=train_sampler,
+        generator=g,
+    )  ### generator is used for random seed
 ```
 
-并且在多个`epoch`的训练时，需要设置`train_dloader.sampler.set_epoch(epoch)`。
+In the case of multiple epochs, it is necessary to configure the data loader's sampler for each epoch using `train_dloader.sampler.set_epoch(epoch)`.
 
-下面来看看`train`函数。
+Next, let's take a look at the `train` function:
 
 ```python
 def train(model, train_dloader, criterion, optimizer, scaler):
@@ -402,11 +419,10 @@ def train(model, train_dloader, criterion, optimizer, scaler):
         scaler.update()  ###
 ```
 
-最后三行发生了改变。相较于原始的`loss.backward`、`optimizer.step()`，这里通过`scaler`对梯度进行缩放，防止由于使用混合精度导致损失下溢，并且对`scaler`自身的状态进行更新呢。如果有多个`loss`，它们也使用同一个`scaler`。如果需要保存模型的`state_dict`并且在后续继续训练（比如预训练-微调模式），最好连带`scaler`的状态一起保留，并在后续的微调过程中和模型的参数异同加载。
+The final three lines of the preceding code segment have been modified. In contrast to the conventional `loss.backward` and `optimizer.step()`, we employ a `scaler` to scale the loss, mitigating the potential for underflow during Automatic Mixed Precision (AMP) training, and we update the `scaler`'s state accordingly. If multiple losses are computed, they should utilize a shared `scaler`. Additionally, when saving the `state_dict` of the model for subsequent training phases, which is a typical practice in the pretrain-finetune paradigm, it is advisable to also preserve the state of the `scaler`. This ensures continuity when loading the model parameters for finetuning.
 
-### 测试
-
-测试时，需要将多个进程的数据`reduce`到一张卡上。注意，在`test`函数的外面加上`if local_rank == 0`，否则多个进程会彼此等待而陷入死锁。
+### Test
+During testing, it is necessary to `reduce` data from all processes to a single process. It is important to note that the `test` function should be executed within the scope of `if local_rank == 0` to avoid synchronization issues that could result in a deadlock among the processes.
 
 ```python
 def test(model, test_dloader):
@@ -428,17 +444,17 @@ def test(model, test_dloader):
         print(f'Accuracy is {acc:.2%}')
 ```
 
-注释的两行即为所需添加的`reduce`操作。
+The two lines concluding with `###` signify the required `reduce` operations.
 
-至此，添加的代码讲解完毕。
+These additions constitute the entirety of the modifications made to the baseline code.
 
-启动的方式变化不大：
+The method for executing the Python script remains similar:
 
 ```bash
 python ddp_main.py --gpu 0,1
 ```
 
-相应的结果：
+Results:
 
 ```bash
 begin training of epoch 1/3
@@ -450,11 +466,10 @@ Accuracy is 89.21%
 time elapsed: 30.82 seconds
 ```
 
-## 用torchrun启动
+## Initiate with torchrun
+In the demonstration provided, we initiate DistributedDataParallel (DDP) using `mp.spawn`. The `mp` module is a wrapper for the `multiprocessing` module and is not specifically optimized for DDP. An alternative approach is to use `torchrun`, which is the recommended method according to the official documentation. The corresponding code is accessible [here](ddp_main_torchrun.py).
 
-上述是通过`mp.spawn`启动。`mp`模块对`multiprocessing`库进行封装，并没有特定针对`DDP`。我们还可以通过官方推荐的`torchrun`进行启动。完整的程序在[这里](https://github.com/rickyang1114/DDP-practice/blob/main/ddp_main_torchrun.py)。
-
-相比`mp.spawn`启动，`torchrun`自动控制一些环境变量的设置，因而更为方便。我们只需要设置`os.environ['CUDA_VISIBLE_DEVICES']`即可（不设置默认为该机器上的所有GPU），而无需设置`os.environ['MASTER_ADDR']`等。此外，`main`函数不再需要`local_rank`参数。程序入口变为：
+Contrasting with the initiation via `mp.spawn`, `torchrun` simplifies the process by automatically managing certain environment variables. The only requirement is to set `os.environ['CUDA_VISIBLE_DEVICES']` to the desired GPUs (by default, it includes all available GPUs). Manual configuration such as `os.environ['MASTER_ADDR']` is no longer necessary. Moreover, the `local_rank` argument is omitted from the `main` function. The entry point of the program is as follows:
 
 ```python
 if __name__ == '__main__':
@@ -467,29 +482,27 @@ if __name__ == '__main__':
         print(f'\ntime elapsed: {time_elapsed:.2f} seconds')
 ```
 
-运行脚本的命令由`python`变为了`torchrun`，如下：
+The command to execute the Python script transitions from using `python` to `torchrun`, exemplified as follows:
 
 ```bash
 torchrun --standalone --nproc_per_node=2 ddp_main_torchrun.py --gpu 0,1
 ```
 
-其中，`nproc_per_node`表示进程数，将其设置为使用的GPU数量即可。
+The `nproc_per_node` parameter specifies the number of processes to be created. It should be set to match the number of GPUs utilized.
 
 ## Checklist
+After completing the implementation of DistributedDataParallel (DDP), it is prudent to conduct a thorough inspection for potential bugs.
 
-在写完 DDP 的代码之后，最好检查一遍，否则很容易因为漏了什么而出现莫名奇妙的错误，比如程序卡着不动了，也不报错）
+Here is a general checklist to guide the review process:
 
-大致需要检查：
-
-1. DDP 初始化有没有完成，包括`if __name__ == '__main__'`里和`main`函数里的。退出`main`函数时摧毁进程。
-2. 模型的封装，包括autocast，BN 层的转化和 DDP 封装
-3. 指定`train_dloader`的`sampler`、`generator`和`shuffle`，并且在每个`epoch`设置`sampler`，测试集、验证集同理。
-4. 训练时使用`scaler`对`loss`进行`scale`
-5. 对于`print`、`log`、`save`等操作，仅在一个线程上进行。
-6. 测试时进行`reduce`
+1. Verify the location and completeness of DDP initialization, which includes code within `if __name__ == '__main__'` and the `main` function. Ensure the process group is destroyed when exiting.
+2. Confirm the model encapsulation, which should cover `autocast`, `convert_sync_batchnorm`, and the integration of DDP.
+3. Check the configuration of `sampler`, `generator`, `shuffle`, and `sampler.set_epoch`, all of which are tailored for DDP usage.
+4. Review the scaling of the loss during training to ensure it is managed correctly.
+5. Ascertain that operations such as `print`, `log`, and `save` are performed by only one process to prevent redundancy.
+6. Ensure proper execution of the `reduce` operation during testing.
 
 ## PS
+Running multiple processes is akin to multiplying the `batch_size` by the number of processes. Consequently, the `batch_size` and `learning_rate` may require adjustment. In our implementation, these hyperparameters were not modified, resulting in minor discrepancies in the accuracy observed before and after the integration of DDP.
 
-多个线程大致相当于增大了相应倍数的`batch_size`，最好相应地调一调`batch_size`和学习率。本文没有进行调节，导致测试获得的准确率有一些差别。
-
-模型较小时速度差别不大，反而DDP与混合精度可能因为一些初始化和精度转换耗费额外时间而更慢。在模型较大时，DDP + 混合精度的速度要明显高于常规，且能降低显存占用。
+For smaller models, the difference in training speed is relatively marginal. However, as the model size increases, the adoption of DDP and AMP results in a significant acceleration of training speed and a reduction in GPU memory usage.
